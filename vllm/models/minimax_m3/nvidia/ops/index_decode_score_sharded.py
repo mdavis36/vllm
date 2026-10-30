@@ -28,9 +28,9 @@ MAX_K_TILES = 8192  # Matches the unified score buffer.
 TOPK = 16
 CANDIDATE_ROW_SIZE = 2 * TOPK + 1
 # Candidate merge kernel: "warp" (one warp per token and owned head),
-# "legacy" (the multi-row kernel), or "auto": warp at TP2, where it is the
-# faster one, legacy at TP4. The merge looks it up on every call, and takes
-# impl= per call, so one process can A/B both.
+# "legacy" (the multi-row kernel), or "auto": warp except for TP4 decode, the
+# one case where legacy is the faster one. The merge looks it up on every
+# call, and takes impl= per call, so one process can A/B both.
 MERGE_IMPL_ENV = "VLLM_MINIMAX_M3_ICP_MERGE"
 MERGE_IMPL = os.getenv(MERGE_IMPL_ENV, "auto")
 # Cap of the warp merge's doubling nanosleep between candidate polls; 0 spins.
@@ -1668,8 +1668,8 @@ def minimax_m3_index_merge_candidates(
     """Merge duplicate blocks by max, force init/local blocks, and sort Top16 IDs.
 
     ``impl`` picks the kernel, ``MERGE_IMPL`` (``$VLLM_MINIMAX_M3_ICP_MERGE``)
-    by default: ``"warp"``, ``"legacy"`` or ``"auto"`` (warp at TP2, legacy
-    at TP4). Both kernels produce identical outputs.
+    by default: ``"warp"``, ``"legacy"`` or ``"auto"`` (warp except for TP4
+    decode, which uses legacy). Both kernels produce identical outputs.
     """
     world, heads, capacity, row_size = recv_slot.shape
     tokens, out_heads, topk = output.shape
@@ -1687,7 +1687,7 @@ def minimax_m3_index_merge_candidates(
     assert num_valid_pages.shape == (tokens,)
     impl = MERGE_IMPL if impl is None else impl
     if impl == "auto":
-        impl = "warp" if world == 2 else "legacy"
+        impl = "warp" if world == 2 or prefill else "legacy"
     if impl == "warp":
         _index_k_merge_warp_kernel[(tokens, heads)](
             recv_slot,
