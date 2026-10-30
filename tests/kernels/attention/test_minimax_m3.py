@@ -3291,6 +3291,200 @@ def test_sharded_candidate_merge_deduplicates_and_forces(
         torch.testing.assert_close(recv[..., :32], before[..., :32], rtol=0, atol=0)
 
 
+def _random_merge_candidates(
+    world, heads, tokens, page_size, init_blocks, local_blocks, seed
+):
+    """Candidate rows as the ranks publish them, plus adversarial rows.
+
+    Returns IDs and scores ``[world, heads, tokens, 16]`` and page counts
+    ``[tokens]``. P128 ranks score every page, so an ID can repeat on every
+    rank; P256 ranks own one parity of B128 pages, so it repeats only within a
+    rank pair. Every third row also repeats IDs within a rank and mixes in
+    padding and out-of-range IDs. Scores mix ties, signed zeros, NaN and
+    infinities into random values.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    counts = [0, 1, 2, 3, 15, 16, 17, 31, 32, 33, 47, 64, 129, 1000, 8191, 8192, 9000]
+    num_valid = torch.tensor(
+        [counts[t % len(counts)] for t in range(tokens)], dtype=torch.int32
+    )
+    ids = torch.full((world, heads, tokens, 16), -1, dtype=torch.int32)
+    odd_ids = torch.tensor([8191, 8192, 2**31 - 1, -(2**31), -1])
+    for t in range(tokens):
+        count = min(int(num_valid[t]), 8192)
+        forced = sorted(
+            set(range(min(init_blocks, count)))
+            | set(range(max(0, count - local_blocks), count))
+        )
+        for h in range(heads):
+            if (t + h) % 3 == 0:
+                row = torch.randint(-2, count + 3, (world, 16), generator=gen)
+                slots = torch.randint(16, (world, 3), generator=gen)
+                picks = odd_ids[torch.randint(len(odd_ids), (world, 3), generator=gen)]
+                ids[:, h, t] = row.scatter_(1, slots, picks).to(torch.int32)
+                continue
+            pool = torch.randperm(max(count, 1), generator=gen)[: 20 + 6 * world]
+            for rank in range(world):
+                parity = rank * 2 // world
+                owned = [
+                    i
+                    for i in forced + pool.tolist()
+                    if page_size == 128 or i % 2 == parity
+                ]
+                row = list(dict.fromkeys(owned))[:16]
+                order = torch.randperm(len(row), generator=gen).tolist()
+                ids[rank, h, t, : len(row)] = torch.tensor(
+                    [row[i] for i in order], dtype=torch.int32
+                )
+    shape = ids.shape
+    scores = torch.randn(shape, generator=gen)
+    kind = torch.randint(10, shape, generator=gen)
+    sign = torch.where(torch.rand(shape, generator=gen) < 0.5, -1.0, 1.0)
+    ties = torch.randint(-2, 3, shape, generator=gen).float()
+    scores = torch.where(kind < 3, ties, scores)
+    scores = torch.where(kind == 3, 0.0 * sign, scores)
+    scores = torch.where(kind == 4, float("nan"), scores)
+    scores = torch.where(kind == 5, float("inf") * sign, scores)
+    return ids, scores, num_valid
+
+
+def _reference_candidate_merge(
+    ids, scores, num_valid, init_blocks, local_blocks, prefill
+):
+    """The merge contract: the 16 best distinct valid IDs, ascending, then -1.
+
+    An ID is valid below its row's page count (at most MAX_K_TILES), scores by
+    its maximum over every copy, NaN counting as -inf and init/local pages as
+    +inf, and ties prefer the lower ID. A prefill row with no pages keeps page
+    0 in its first slot.
+    """
+    world, heads, tokens, _ = ids.shape
+    out = torch.full((tokens, heads, 16), -1, dtype=torch.int32)
+    for t in range(tokens):
+        count = min(int(num_valid[t]), 8192)
+        for h in range(heads):
+            best: dict[int, float] = {}
+            for i, s in zip(
+                ids[:, h, t].flatten().tolist(), scores[:, h, t].flatten().tolist()
+            ):
+                if not 0 <= i < count:
+                    continue
+                if s != s:
+                    s = float("-inf")
+                if i < init_blocks or i >= max(0, count - local_blocks):
+                    s = float("inf")
+                best[i] = max(best.get(i, s), s)
+            top = sorted(best, key=lambda i: (-best[i], i))[:16]
+            out[t, h, : len(top)] = torch.tensor(sorted(top), dtype=torch.int32)
+            if prefill and count == 0:
+                out[t, h, 0] = 0
+    return out
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA candidate exchange")
+@pytest.mark.parametrize("init_blocks,local_blocks", [(0, 0), (0, 1), (1, 1), (3, 4)])
+@pytest.mark.parametrize("mode", ["legacy", "tagged", "prefill"])
+@pytest.mark.parametrize("page_size", [128, 256])
+@pytest.mark.parametrize("world", [2, 4])
+def test_sharded_candidate_merge_warp_matches_legacy(
+    world, page_size, mode, init_blocks, local_blocks
+):
+    """The warp merge matches the legacy merge bit for bit, side effects too."""
+    pytest.importorskip("cutlass")
+    from vllm.models.minimax_m3.nvidia.ops.index_decode_score_sharded import (
+        MAX_K_TILES,
+        minimax_m3_index_merge_candidates,
+    )
+
+    assert MAX_K_TILES == 8192
+    heads, tokens = 2, 51
+    capacity = tokens + 3
+    ids, scores, num_valid = _random_merge_candidates(
+        world,
+        heads,
+        tokens,
+        page_size,
+        init_blocks,
+        local_blocks,
+        seed=1000 * world + page_size + 10 * init_blocks + local_blocks,
+    )
+    expected = _reference_candidate_merge(
+        ids, scores, num_valid, init_blocks, local_blocks, mode == "prefill"
+    )
+
+    tagged = mode == "tagged"
+    bits = scores.view(torch.int32)
+    # Tagged rows carry one past each counter, wrapping through 2**32 and
+    # skipping the zero reserved for unwritten words.
+    generations = torch.zeros((3, heads, capacity), dtype=torch.int32)
+    pattern = torch.tensor([0, 5, -2, -1, 123456789], dtype=torch.int32)
+    generations[1, :, :tokens] = pattern[
+        torch.arange(heads * tokens) % len(pattern)
+    ].view(heads, tokens)
+    tags = (generations[1, :, :tokens].long() + 1) & 0xFFFFFFFF
+    tags = tags.masked_fill(tags == 0, 1).to(torch.int32)
+    if tagged:
+        recv = torch.zeros((3, world, heads, capacity, 32), dtype=torch.int64)
+        row_tags = tags[None, :, :, None].expand_as(ids)
+        for start, payload in ((0, bits), (16, ids)):
+            # Little-endian (payload, tag) pairs are the (tag << 32) | payload words.
+            words = torch.stack([payload, row_tags], dim=-1).view(torch.int64)
+            recv[1, :, :, :tokens, start : start + 16] = words.squeeze(-1)
+    else:
+        recv = torch.zeros((3, world, heads, capacity, 33), dtype=torch.int32)
+        recv[1, :, :, :tokens, :16] = bits
+        recv[1, :, :, :tokens, 16:32] = ids
+        # Prefill rows arrive by NCCL; their ready words are not a handshake.
+        recv[1, :, :, :tokens, 32] = 1 if mode == "legacy" else -7
+
+    results = {}
+    for impl in ("legacy", "warp"):
+        recv_run, generations_run = recv.cuda(), generations.cuda()
+        storage = torch.full(
+            (tokens + 2, heads + 1, 16), -9, dtype=torch.int32, device="cuda"
+        )
+        valid_storage = torch.full((2 * tokens,), -5, dtype=torch.int32)
+        valid_storage[::2] = num_valid
+        valid_storage = valid_storage.cuda()
+        errors = torch.zeros(1, dtype=torch.int32, device="cuda")
+        minimax_m3_index_merge_candidates(
+            recv_run[1],
+            valid_storage[::2],
+            storage[1:-1, 1:],
+            errors,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            spin_limit=1 << 12,
+            use_pdl=mode != "prefill",
+            expected_generations=generations_run[1] if tagged else None,
+            prefill=mode == "prefill",
+            impl=impl,
+        )
+        assert errors.item() == 0, impl
+        assert torch.all(storage[[0, -1]] == -9).item(), impl
+        assert torch.all(storage[:, 0] == -9).item(), impl
+        results[impl] = (
+            storage[1:-1, 1:].cpu(),
+            recv_run.cpu(),
+            generations_run.cpu(),
+        )
+
+    legacy, warp = results["legacy"], results["warp"]
+    assert torch.equal(warp[0], legacy[0]), "warp merge output differs from legacy"
+    assert torch.equal(legacy[0], expected), "legacy merge differs from the contract"
+    assert torch.equal(warp[1], legacy[1]), "warp merge left different receive rows"
+    assert torch.equal(warp[2], legacy[2]), "warp merge left different generations"
+    if mode == "legacy":
+        assert torch.equal(warp[1][..., :32], recv[..., :32])
+        assert torch.count_nonzero(warp[1][..., 32]).item() == 0
+    else:
+        assert torch.equal(warp[1], recv)
+    consumed = generations.clone()
+    if tagged:
+        consumed[1, :, :tokens] = tags
+    assert torch.equal(warp[2], consumed)
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(100),
     reason="Native prefill TopK requires SM100 family.",

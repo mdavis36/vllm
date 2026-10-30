@@ -3,6 +3,7 @@
 """Decode index scores over TP-sharded FP8 or NVFP4 keys and exchange top-k
 candidates."""
 
+import os
 from functools import cache
 
 import cutlass
@@ -26,6 +27,13 @@ DEFAULT_SPLIT_K = 128
 MAX_K_TILES = 8192  # Matches the unified score buffer.
 TOPK = 16
 CANDIDATE_ROW_SIZE = 2 * TOPK + 1
+# Candidate merge kernel: "warp" (one warp per token and owned head) or
+# "legacy" (the multi-row kernel). The merge looks it up on every call, and
+# takes impl= per call, so one process can A/B both.
+MERGE_IMPL_ENV = "VLLM_MINIMAX_M3_ICP_MERGE"
+MERGE_IMPL = os.getenv(MERGE_IMPL_ENV, "warp")
+# Cap of the warp merge's doubling nanosleep between candidate polls; 0 spins.
+MERGE_POLL_BACKOFF_NS = 128
 
 
 class IndexDecodeScoreShardedKernel:
@@ -1314,6 +1322,291 @@ def _index_k_merge_candidates_kernel(
         tl.extra.cuda.gdc_wait()
 
 
+# The warp merge below keeps every tensor at 32 elements in a one-warp program,
+# so element i lives only in lane i; its warp-collective asm relies on that.
+
+
+@triton.jit
+def _merge_nanosleep(ns):
+    return tl.inline_asm_elementwise(
+        "nanosleep.u32 $1; mov.u32 $0, 0;",
+        "=r,r",
+        [ns],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _merge_tagged_poll(source, generation):
+    """Load a lane's tagged score and ID words; 1 where either is stale."""
+    score_words = _index_k_load_tagged_word(source)
+    id_words = _index_k_load_tagged_word(source + 16)
+    stale = ((score_words >> 32) != generation) | ((id_words >> 32) != generation)
+    return score_words, id_words, stale.to(tl.int32)
+
+
+@triton.jit
+def _merge_ordered(ids, scores, nvalid, INIT: tl.constexpr, LOCAL: tl.constexpr):
+    """Validity and the order-preserving uint32 key of each candidate's score."""
+    valid = (ids >= 0) & (ids < nvalid)
+    scores = tl.where(scores == scores, scores, -float("inf"))
+    forced = (ids < INIT) | (ids >= tl.maximum(0, nvalid - LOCAL))
+    scores = tl.where(forced, float("inf"), scores)
+    bits = tl.where(scores == 0, 0.0, scores).to(tl.uint32, bitcast=True)
+    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000)
+    return valid, ordered
+
+
+@triton.jit
+def _merge_shfl(x, src):
+    """Lane ``src``'s 32-bit ``x``."""
+    return tl.inline_asm_elementwise(
+        "shfl.sync.idx.b32 $0, $1, $2, 0x1f, 0xffffffff;",
+        "=r,r,r",
+        [x, src],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _merge_shfl64(x, src):
+    """Lane ``src``'s 64-bit ``x``."""
+    return tl.inline_asm_elementwise(
+        """{
+        .reg .b32 lo, hi;
+        mov.b64 {lo, hi}, $1;
+        shfl.sync.idx.b32 lo, lo, $2, 0x1f, 0xffffffff;
+        shfl.sync.idx.b32 hi, hi, $2, 0x1f, 0xffffffff;
+        mov.b64 $0, {lo, hi};
+        }""",
+        "=l,l,r",
+        [x, src],
+        dtype=tl.uint64,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _merge_nth_flagged_lane(flag, n):
+    """Lane of the ``n``-th (1-based) lane whose ``flag`` is set, or -1."""
+    return tl.inline_asm_elementwise(
+        """{
+        .reg .pred p;
+        .reg .b32 mask;
+        setp.ne.u32 p, $1, 0;
+        vote.sync.ballot.b32 mask, p, 0xffffffff;
+        fns.b32 $0, mask, 0, $2;
+        }""",
+        "=r,r,r",
+        [flag, n],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _merge_top16(ids, ordered, live):
+    """Deduplicate one candidate per lane by ID and rank them.
+
+    Copies of an ID merge into their lowest lane with the maximum ordered key.
+    Returns each lane's ``(ordered, 0xFFFFFFFF - id)`` key, 0 where the lane is
+    dead or a copy, and whether that key is among the 16 largest. Copies share
+    liveness because liveness depends on the ID alone.
+    """
+    # Retain the maximum on the first matching lane, as the legacy TP2 merge.
+    best, leader = tl.inline_asm_elementwise(
+        """{
+        .reg .b32 peers, reversed, first, lane;
+        .reg .pred p;
+        match.any.sync.b32 peers, $2, 0xffffffff;
+        redux.sync.max.u32 $0, $3, peers;
+        brev.b32 reversed, peers;
+        clz.b32 first, reversed;
+        mov.u32 lane, %laneid;
+        setp.eq.u32 p, lane, first;
+        selp.u32 $1, 1, 0, p;
+        }""",
+        constraints="=r,=r,r,r",
+        args=[ids, ordered],
+        dtype=(tl.uint32, tl.int32),
+        is_pure=True,
+        pack=1,
+    )
+    key = (best.to(tl.uint64) << 32) | (0xFFFFFFFF - ids.to(tl.uint32)).to(tl.uint64)
+    key = tl.where(live & (leader != 0), key, 0)
+    # Live keys are distinct, so the number of larger keys is a strict rank.
+    rank = tl.zeros_like(leader)
+    for j in tl.static_range(32):
+        other = _merge_shfl64(key, tl.full([32], j, tl.int32))
+        rank += (other > key).to(tl.int32)
+    return key, (key != 0) & (rank < 16)
+
+
+@triton.jit
+def _merge_gather_halves(key_a, top_a, key_b, top_b, lane):
+    """Pack A's selected keys into lanes 0-15 and B's into lanes 16-31.
+
+    Returns the packed IDs (distinct negatives on empty lanes, so they never
+    match), their ordered keys, and which lanes are live.
+    """
+    low = lane < 16
+    n = (lane & 15) + 1
+    src = tl.where(
+        low,
+        _merge_nth_flagged_lane(top_a.to(tl.int32), n),
+        _merge_nth_flagged_lane(top_b.to(tl.int32), n),
+    )
+    key = tl.where(low, _merge_shfl64(key_a, src), _merge_shfl64(key_b, src))
+    live = src >= 0
+    ids = tl.where(live, (0xFFFFFFFF - key.to(tl.uint32)).to(tl.int32), -1 - lane)
+    ordered = tl.where(live, (key >> 32).to(tl.uint32), 0)
+    return ids, ordered, live
+
+
+@triton.jit
+def _index_k_merge_warp_kernel(
+    recv_ptr,
+    valid_ptr,
+    out_ptr,
+    out_stride_t,
+    out_stride_h,
+    valid_stride,
+    err_ptr,
+    recv_stride_src,
+    recv_stride_h,
+    recv_stride_t,
+    expected_generations,
+    generation_stride_h,
+    TAGGED: tl.constexpr,
+    PREFILL: tl.constexpr,
+    W: tl.constexpr,
+    INIT: tl.constexpr,
+    LOCAL: tl.constexpr,
+    MAX_TILES: tl.constexpr,
+    SPIN: tl.constexpr,
+    BACKOFF_NS: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    """One warp merges one (token, owned head) row.
+
+    Same contract as ``_index_k_merge_candidates_kernel``. Lane l holds
+    candidate l (ranks 0-1); at TP4 it also holds candidate 32 + l (ranks
+    2-3). TP2 deduplicates with match.any and ranks the 32 keys by shuffles.
+    TP4 first selects the top 16 of each 32-candidate half, which keeps every
+    ID of the overall top 16 with its exact maximum, then merges those 32 as at
+    TP2. The ascending output position of each winner is the number of smaller
+    winning IDs, so no sort runs.
+    """
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    if TAGGED and W == 2:  # noqa: SIM102
+        # As the legacy TP2 tagged merge: dependents may launch right away.
+        if launch_pdl:
+            tl.extra.cuda.gdc_launch_dependents()
+    lane = tl.arange(0, 32)
+    # Independent of the candidates: issue it before polling for them.
+    nvalid = tl.minimum(tl.load(valid_ptr + t * valid_stride), MAX_TILES)
+    row = recv_ptr + h * recv_stride_h + t * recv_stride_t
+    source_a = row + lane // 16 * recv_stride_src + lane % 16
+    source_b = source_a + 2 * recv_stride_src
+    if PREFILL:
+        ids_a = tl.load(source_a + 16)
+        scores_a = tl.load(source_a).to(tl.float32, bitcast=True)
+        if W == 4:
+            ids_b = tl.load(source_b + 16)
+            scores_b = tl.load(source_b).to(tl.float32, bitcast=True)
+        pending = 0
+    elif TAGGED:
+        counter = expected_generations + h * generation_stride_h + t
+        generation = tl.load(counter).to(tl.uint32) + 1
+        generation = tl.where(generation == 0, 1, generation).to(tl.uint32)
+        pending, spins, nap = 1, 0, 32
+        score_a = tl.zeros([32], tl.uint64)
+        id_a = tl.zeros([32], tl.uint64)
+        if W == 4:
+            score_b = tl.zeros([32], tl.uint64)
+            id_b = tl.zeros([32], tl.uint64)
+        while (pending > 0) & (spins < SPIN):
+            if BACKOFF_NS > 0:  # noqa: SIM102
+                if spins > 0:
+                    _merge_nanosleep(nap + lane * 0)
+                    nap = tl.minimum(nap * 2, BACKOFF_NS)
+            score_a, id_a, stale = _merge_tagged_poll(source_a, generation)
+            if W == 4:
+                score_b, id_b, stale_b = _merge_tagged_poll(source_b, generation)
+                stale += stale_b
+            pending = tl.sum(stale, 0)
+            spins += 1
+        ids_a = id_a.to(tl.int32)
+        scores_a = score_a.to(tl.uint32).to(tl.float32, bitcast=True)
+        if W == 4:
+            ids_b = id_b.to(tl.int32)
+            scores_b = score_b.to(tl.uint32).to(tl.float32, bitcast=True)
+    else:
+        ready = row + tl.arange(0, W) * recv_stride_src + 32
+        seen = tl.atomic_add(ready, 0, sem="acquire", scope="sys")
+        pending = tl.sum((seen != 1).to(tl.int32), 0)
+        spins, nap = 0, 32
+        while (pending > 0) & (spins < SPIN):
+            if BACKOFF_NS > 0:
+                _merge_nanosleep(nap + lane * 0)
+                nap = tl.minimum(nap * 2, BACKOFF_NS)
+            seen = tl.atomic_add(ready, 0, sem="acquire", scope="sys")
+            pending = tl.sum((seen != 1).to(tl.int32), 0)
+            spins += 1
+        ids_a = tl.load(source_a + 16)
+        scores_a = tl.load(source_a).to(tl.float32, bitcast=True)
+        if W == 4:
+            ids_b = tl.load(source_b + 16)
+            scores_b = tl.load(source_b).to(tl.float32, bitcast=True)
+    if pending > 0:
+        tl.atomic_add(err_ptr, 1)
+        tl.inline_asm_elementwise(
+            "trap; mov.u32 $0, 0;", "=r", [], dtype=tl.int32, is_pure=False, pack=1
+        )
+
+    valid_a, ordered_a = _merge_ordered(ids_a, scores_a, nvalid, INIT, LOCAL)
+    if W == 2:
+        ids = ids_a
+        _, top = _merge_top16(ids_a, ordered_a, valid_a)
+    else:
+        valid_b, ordered_b = _merge_ordered(ids_b, scores_b, nvalid, INIT, LOCAL)
+        key_a, top_a = _merge_top16(ids_a, ordered_a, valid_a)
+        key_b, top_b = _merge_top16(ids_b, ordered_b, valid_b)
+        ids, ordered, live = _merge_gather_halves(key_a, top_a, key_b, top_b, lane)
+        _, top = _merge_top16(ids, ordered, live)
+
+    # Each winner's output slot is the number of smaller winning IDs.
+    sorted_ids = tl.where(top, ids, 0x7FFFFFFF)
+    position = tl.zeros_like(lane)
+    for j in tl.static_range(32):
+        other = _merge_shfl(sorted_ids, tl.full([32], j, tl.int32))
+        position += (other < sorted_ids).to(tl.int32)
+    count = tl.sum(top.to(tl.int32), 0)
+    filler = tl.full([32], -1, tl.int32)
+    if PREFILL:
+        # Keep graph-padding rows nonempty for downstream CSR construction.
+        filler = tl.where((nvalid == 0) & (lane == 0), 0, filler)
+    out = out_ptr + t * out_stride_t + h * out_stride_h
+    tl.store(out + position, ids, mask=top)
+    tl.store(out + lane, filler, mask=(lane >= count) & (lane < 16))
+    if not PREFILL:
+        tl.debug_barrier()
+        if TAGGED:
+            tl.store(counter, generation)
+        else:
+            tl.atomic_xchg(ready, 0, sem="release", scope="sys")
+    if launch_pdl:
+        # Do not let the next layer reuse scratch before this publisher exits.
+        tl.extra.cuda.gdc_wait()
+
+
 def minimax_m3_index_select_publish_candidates(
     scores: torch.Tensor,
     num_valid_pages: torch.Tensor,
@@ -1369,8 +1662,13 @@ def minimax_m3_index_merge_candidates(
     use_pdl: bool = False,
     expected_generations: torch.Tensor | None = None,
     prefill: bool = False,
+    impl: str | None = None,
 ) -> None:
-    """Merge duplicate blocks by max, force init/local blocks, and sort Top16 IDs."""
+    """Merge duplicate blocks by max, force init/local blocks, and sort Top16 IDs.
+
+    ``impl`` picks the kernel, ``MERGE_IMPL`` (``$VLLM_MINIMAX_M3_ICP_MERGE``)
+    by default: ``"warp"`` or ``"legacy"``. Both produce identical outputs.
+    """
     world, heads, capacity, row_size = recv_slot.shape
     tokens, out_heads, topk = output.shape
     assert world in SUPPORTED_TP and out_heads == heads
@@ -1385,6 +1683,34 @@ def minimax_m3_index_merge_candidates(
         assert expected_generations.is_contiguous()
     assert recv_slot.stride(-1) == output.stride(-1) == 1
     assert num_valid_pages.shape == (tokens,)
+    impl = MERGE_IMPL if impl is None else impl
+    if impl == "warp":
+        _index_k_merge_warp_kernel[(tokens, heads)](
+            recv_slot,
+            num_valid_pages,
+            output,
+            output.stride(0),
+            output.stride(1),
+            num_valid_pages.stride(0),
+            errors,
+            recv_slot.stride(0),
+            recv_slot.stride(1),
+            recv_slot.stride(2),
+            expected_generations,
+            capacity,
+            TAGGED=tagged,
+            PREFILL=prefill,
+            W=world,
+            INIT=init_blocks,
+            LOCAL=local_blocks,
+            MAX_TILES=MAX_K_TILES,
+            SPIN=spin_limit,
+            BACKOFF_NS=MERGE_POLL_BACKOFF_NS,
+            launch_pdl=use_pdl,
+            num_warps=1,
+        )
+        return
+    assert impl == "legacy", f"unknown candidate merge {impl!r}"
     rows = 8 if world == 2 and (prefill or tagged) else 1
     grid = triton.cdiv(tokens, rows)
     if tagged and world == 2:
