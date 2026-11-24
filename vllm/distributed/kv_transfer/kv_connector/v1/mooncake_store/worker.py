@@ -80,6 +80,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.protocol import
     decode_lookup_response,
     encode_lookup_response,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.registration import (  # noqa: E501
+    chunked_kv_registration_piece_bytes,
+    register_device_region,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake_store.selective_lease import (  # noqa: E501
     SelectiveLookupLease,
 )
@@ -2179,6 +2183,9 @@ class MooncakeStoreWorker:
         self.num_blocks = self._kv_cache_config.num_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
         register_kv = not self._reuse_pd_transfer_engine
+        # Device storages are registered in pieces when this is set
+        # (mooncake_store/registration.py); host ones stay whole.
+        device_piece_bytes = chunked_kv_registration_piece_bytes()
         if not register_kv:
             logger.info(
                 "Mooncake store skipping KV registration; "
@@ -2210,7 +2217,9 @@ class MooncakeStoreWorker:
                 seen_storage_ptrs.add(base_addr)
                 region_len = cache_storage.nbytes()
                 if register_kv:
-                    ret = self.store.register_buffer(base_addr, region_len)
+                    ret, pieces = register_device_region(
+                        self.store, base_addr, region_len, device_piece_bytes
+                    )
                     if ret != 0:
                         logger.error(
                             "register_buffer failed for addr %#x len %d: %d",
@@ -2219,7 +2228,7 @@ class MooncakeStoreWorker:
                             ret,
                         )
                     else:
-                        self._device_regions[base_addr] = region_len
+                        self._device_regions.update(pieces)
             for group_id, (group, db) in enumerate(
                 zip(self._kv_cache_groups, self.token_dbs, strict=True)
             ):
@@ -2302,7 +2311,12 @@ class MooncakeStoreWorker:
                 registered_len = registered_buffers.get(base_addr)
                 if registered_len is None:
                     if register_kv:
-                        ret = self.store.register_buffer(base_addr, region_len)
+                        ret, pieces = register_device_region(
+                            self.store,
+                            base_addr,
+                            region_len,
+                            None if is_host_resident else device_piece_bytes,
+                        )
                         if ret != 0:
                             mem_kind = "host" if is_host_resident else "device"
                             raise RuntimeError(
@@ -2310,7 +2324,7 @@ class MooncakeStoreWorker:
                                 f"{base_addr:#x} len {region_len} ({mem_kind}): {ret}"
                             )
                         if not is_host_resident:
-                            self._device_regions[base_addr] = region_len
+                            self._device_regions.update(pieces)
                     registered_buffers[base_addr] = region_len
                 elif registered_len != region_len:
                     raise ValueError(
