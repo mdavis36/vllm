@@ -753,11 +753,15 @@ impl EngineCoreClient {
         let stream_interval = (req.sampling_params.as_ref())
             .and_then(|params| params.stream_interval)
             .unwrap_or(NonZeroU32::MIN);
+        let prompt_tokens = (req.prompt_token_ids.as_ref())
+            .and_then(|ids| ids.shape.first().copied())
+            .unwrap_or(0);
         let (engine_id, rx) = self.inner.register_request(
             request_id.clone(),
             lora_name,
             data_parallel_rank,
             stream_interval,
+            prompt_tokens,
         )?;
 
         // Construct the output stream first before actually sending the request to the engine.

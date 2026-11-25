@@ -126,20 +126,29 @@ impl ClientInner {
     /// per-request output channel bound to its `request_id`.
     ///
     /// When `data_parallel_rank` is provided, the request is routed to that
-    /// specific engine rank, bypassing load balancing. `lora_name` is the
+    /// specific engine rank, bypassing load balancing, unless
+    /// `VLLM_DP_RANK_HINT_SLACK` makes the rank a hint. `lora_name` is the
     /// request's LoRA adapter, tracked for `vllm:lora_requests_info`.
+    /// `prompt_tokens` breaks ties when a rank hint is overridden.
     pub fn register_request(
         &self,
         request_id: String,
         lora_name: Option<String>,
         data_parallel_rank: Option<u32>,
         stream_interval: NonZeroU32,
+        prompt_tokens: usize,
     ) -> Result<(EngineId, OutputReceiver)> {
         let mut registry = self.request_reg.lock();
         if registry.is_closed() {
             return Err(self.closed_error());
         }
-        registry.register(request_id, lora_name, data_parallel_rank, stream_interval)
+        registry.register_with_prompt_tokens(
+            request_id,
+            lora_name,
+            data_parallel_rank,
+            stream_interval,
+            prompt_tokens,
+        )
     }
 
     /// Allocate the next utility `call_id` and register its waiting receiver.

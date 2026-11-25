@@ -3,10 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::oneshot;
-use tracing::trace;
+use tracing::{debug, info, trace, warn};
 
 use crate::EngineId;
 use crate::client::output_channel::output_channel;
@@ -21,12 +22,56 @@ use crate::transport::ConnectedEngine;
 pub type UtilitySender = oneshot::Sender<Result<UtilityOutput>>;
 pub type UtilityReceiver = oneshot::Receiver<Result<UtilityOutput>>;
 
+/// Environment variable that turns a request's `data_parallel_rank` from an
+/// exclusive pin into a hint.
+///
+/// Unset (the default), a request that names a rank always goes to that rank.
+/// Set to a non-negative integer `N`, the named rank is kept while its routing
+/// score is at most `N` above the least-loaded rank's; otherwise the request
+/// goes to the least-loaded rank, ties broken by the fewest in-flight prompt
+/// tokens. Meant for a decode-only DP deployment behind an external router
+/// whose rank choice can be stale or sticky (session affinity), where the
+/// frontend sees each rank's live load.
+pub const DP_RANK_HINT_SLACK_ENV: &str = "VLLM_DP_RANK_HINT_SLACK";
+
+/// How many hinted requests pass between two summary log lines.
+const DP_RANK_HINT_LOG_INTERVAL: u64 = 1000;
+
+/// Read [`DP_RANK_HINT_SLACK_ENV`] once per process and log the mode once.
+fn dp_rank_hint_slack_from_env() -> Option<usize> {
+    static SLACK: OnceLock<Option<usize>> = OnceLock::new();
+    *SLACK.get_or_init(|| {
+        let value = std::env::var(DP_RANK_HINT_SLACK_ENV).ok()?;
+        match value.trim().parse::<usize>() {
+            Ok(slack) => {
+                info!(
+                    slack,
+                    "{DP_RANK_HINT_SLACK_ENV}={slack}: a request's data_parallel_rank is a hint; \
+                     it moves to the least-loaded rank when the hinted rank's load exceeds \
+                     the least-loaded rank's by more than {slack}"
+                );
+                Some(slack)
+            }
+            Err(_) => {
+                warn!(
+                    value,
+                    "{DP_RANK_HINT_SLACK_ENV} is not a non-negative integer; \
+                     data_parallel_rank stays an exclusive pin"
+                );
+                None
+            }
+        }
+    })
+}
+
 #[derive(Debug)]
 struct TrackedRequest {
     sender: OutputSender,
     engine_id: EngineId,
     lora: Option<LoraRequestState>,
     admission_stats_generation: Option<u64>,
+    /// Prompt tokens counted in the engine's `inflight_prompt_tokens`.
+    prompt_tokens: usize,
 }
 
 /// Frontend-side view of one LoRA request's scheduling phase.
@@ -76,6 +121,9 @@ struct EngineRoutingState {
     admitted_since_stats: usize,
     /// Identifies admissions made after the latest scheduler snapshot.
     stats_generation: u64,
+    /// Prompt tokens of the requests counted in `inflight`. Only breaks ties
+    /// when a rank hint is overridden.
+    inflight_prompt_tokens: usize,
 }
 
 impl EngineRoutingState {
@@ -93,8 +141,9 @@ impl EngineRoutingState {
     }
 
     /// Record one request admitted to this engine.
-    fn record_admission(&mut self) -> Option<u64> {
+    fn record_admission(&mut self, prompt_tokens: usize) -> Option<u64> {
         self.inflight += 1;
+        self.inflight_prompt_tokens += prompt_tokens;
         if self.last_scheduler_stats.is_some() {
             self.admitted_since_stats += 1;
             return Some(self.stats_generation);
@@ -104,8 +153,9 @@ impl EngineRoutingState {
 
     /// Record one request removed from this engine. Its admission is dropped
     /// from `admitted_since_stats` only if no newer snapshot has reset that count.
-    fn record_removal(&mut self, admission_stats_generation: Option<u64>) {
+    fn record_removal(&mut self, admission_stats_generation: Option<u64>, prompt_tokens: usize) {
         self.inflight -= 1;
+        self.inflight_prompt_tokens -= prompt_tokens;
         if admission_stats_generation == Some(self.stats_generation) {
             self.admitted_since_stats -= 1;
         }
@@ -135,10 +185,25 @@ pub struct RequestRegistry {
     requests: HashMap<String, TrackedRequest>,
     active_lora_requests: usize,
     routing_per_engine: BTreeMap<EngineId, EngineRoutingState>,
+    /// `Some(slack)` when a request's rank is a hint ([`DP_RANK_HINT_SLACK_ENV`]).
+    dp_rank_hint_slack: Option<usize>,
+    /// Requests that named a rank while hints are soft.
+    dp_rank_hints: u64,
+    /// Of those, the requests sent to another rank than the one they named.
+    dp_rank_hints_moved: u64,
 }
 
 impl RequestRegistry {
     pub fn new(engines: &[ConnectedEngine]) -> Self {
+        Self::with_dp_rank_hint_slack(engines, dp_rank_hint_slack_from_env())
+    }
+
+    /// Like [`Self::new`], with the rank-hint slack given instead of read from
+    /// [`DP_RANK_HINT_SLACK_ENV`].
+    pub fn with_dp_rank_hint_slack(
+        engines: &[ConnectedEngine],
+        dp_rank_hint_slack: Option<usize>,
+    ) -> Self {
         Self {
             closed: false,
             requests: HashMap::default(),
@@ -147,24 +212,49 @@ impl RequestRegistry {
                 .iter()
                 .map(|engine| (engine.engine_id.clone(), EngineRoutingState::default()))
                 .collect(),
+            dp_rank_hint_slack,
+            dp_rank_hints: 0,
+            dp_rank_hints_moved: 0,
         }
     }
 
-    /// Register a newly added request. Create the per-request output channel
-    /// bound to its `request_id` and return the selected engine id.
-    ///
-    /// When `data_parallel_rank` is provided, the request is routed directly to
-    /// the engine at that rank index, bypassing load balancing. Otherwise
-    /// the engine with the lowest routing score is chosen.
-    ///
-    /// `stream_interval` sets how many new tokens the channel batches into one
-    /// delivery after the first output; see [`OutputSender::send`].
+    /// [`Self::register_with_prompt_tokens`] for a request without a prompt
+    /// token count.
+    #[cfg(test)]
     pub fn register(
         &mut self,
         request_id: String,
         lora_name: Option<String>,
         data_parallel_rank: Option<u32>,
         stream_interval: NonZeroU32,
+    ) -> Result<(EngineId, OutputReceiver)> {
+        self.register_with_prompt_tokens(
+            request_id,
+            lora_name,
+            data_parallel_rank,
+            stream_interval,
+            0,
+        )
+    }
+
+    /// Register a newly added request. Create the per-request output channel
+    /// bound to its `request_id` and return the selected engine id.
+    ///
+    /// When `data_parallel_rank` is provided, the request is routed directly to
+    /// the engine at that rank index, bypassing load balancing, unless
+    /// [`DP_RANK_HINT_SLACK_ENV`] makes the rank a hint. Otherwise the engine
+    /// with the lowest routing score is chosen.
+    ///
+    /// `stream_interval` sets how many new tokens the channel batches into one
+    /// delivery after the first output; see [`OutputSender::send`].
+    /// `prompt_tokens` breaks ties when a rank hint is overridden.
+    pub fn register_with_prompt_tokens(
+        &mut self,
+        request_id: String,
+        lora_name: Option<String>,
+        data_parallel_rank: Option<u32>,
+        stream_interval: NonZeroU32,
+        prompt_tokens: usize,
     ) -> Result<(EngineId, OutputReceiver)> {
         if self.requests.contains_key(&request_id) {
             return Err(Error::DuplicateRequestId { request_id });
@@ -183,7 +273,7 @@ impl RequestRegistry {
             .routing_per_engine
             .get_mut(&engine_id)
             .expect("request registry must track all known engines");
-        let admission_stats_generation = state.record_admission();
+        let admission_stats_generation = state.record_admission(prompt_tokens);
 
         self.requests.insert(
             request_id,
@@ -192,6 +282,7 @@ impl RequestRegistry {
                 engine_id: engine_id.clone(),
                 lora,
                 admission_stats_generation,
+                prompt_tokens,
             },
         );
 
@@ -201,7 +292,7 @@ impl RequestRegistry {
     fn choose_engine_for_request(&mut self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         if let Some(rank) = data_parallel_rank {
             let engine_id = u16::try_from(rank).ok().map(EngineId::from_engine_index);
-            return engine_id
+            let engine_id = engine_id
                 .filter(|engine_id| self.routing_per_engine.contains_key(engine_id))
                 .ok_or_else(|| Error::InvalidDataParallelRank {
                     rank,
@@ -210,7 +301,11 @@ impl RequestRegistry {
                         .keys()
                         .filter_map(EngineId::engine_index)
                         .collect(),
-                });
+                })?;
+            return Ok(match self.dp_rank_hint_slack {
+                None => engine_id,
+                Some(slack) => self.apply_dp_rank_hint(engine_id, slack),
+            });
         }
 
         Ok(self
@@ -219,6 +314,45 @@ impl RequestRegistry {
             .min_by_key(|(_, state)| state.routing_score())
             .map(|(engine_id, _)| engine_id.clone())
             .expect("request registry must contain at least one engine"))
+    }
+
+    /// Keep the hinted engine unless its routing score exceeds the least-loaded
+    /// engine's by more than `slack`; then pick the least-loaded engine, with
+    /// the fewest in-flight prompt tokens among equals.
+    fn apply_dp_rank_hint(&mut self, hinted: EngineId, slack: usize) -> EngineId {
+        let hinted_score = self.routing_per_engine[&hinted].routing_score();
+        let (least_loaded, least_state) = self
+            .routing_per_engine
+            .iter()
+            .min_by_key(|(_, state)| (state.routing_score(), state.inflight_prompt_tokens))
+            .expect("request registry must contain at least one engine");
+        let least_score = least_state.routing_score();
+
+        self.dp_rank_hints += 1;
+        let chosen = if hinted_score > least_score.saturating_add(slack) {
+            self.dp_rank_hints_moved += 1;
+            debug!(
+                hinted = ?hinted,
+                hinted_score,
+                chosen = ?least_loaded,
+                least_score,
+                "moved a request off its hinted data parallel rank"
+            );
+            least_loaded.clone()
+        } else {
+            hinted
+        };
+        if self.dp_rank_hints.is_multiple_of(DP_RANK_HINT_LOG_INTERVAL) {
+            info!(
+                moved = self.dp_rank_hints_moved,
+                hinted = self.dp_rank_hints,
+                slack,
+                "data parallel rank hints: {} of {} requests moved to a less-loaded rank",
+                self.dp_rank_hints_moved,
+                self.dp_rank_hints
+            );
+        }
+        chosen
     }
 
     /// Filter the given request IDs to the subset that are still tracked as
@@ -387,7 +521,7 @@ impl RequestRegistry {
         self.routing_per_engine
             .get_mut(&tracked.engine_id)
             .expect("request registry must track all known engines")
-            .record_removal(tracked.admission_stats_generation);
+            .record_removal(tracked.admission_stats_generation, tracked.prompt_tokens);
         Some((tracked.sender, tracked.engine_id))
     }
 
@@ -1256,6 +1390,207 @@ mod tests {
                 connected_ranks,
             } if connected_ranks == vec![3]
         ));
+    }
+
+    fn soft_hint_registry(ranks: &[u16], slack: usize) -> RequestRegistry {
+        let engines: Vec<_> = ranks
+            .iter()
+            .map(|rank| connected_engine(EngineId::from_engine_index(*rank)))
+            .collect();
+        RequestRegistry::with_dp_rank_hint_slack(&engines, Some(slack))
+    }
+
+    fn set_running(registry: &mut RequestRegistry, rank: u32, running: usize, waiting: usize) {
+        assert!(registry.apply_scheduler_counts(rank, EngineLoadSnapshot { waiting, running }));
+    }
+
+    #[test]
+    fn rank_hint_without_slack_is_an_exclusive_pin() {
+        let mut registry = RequestRegistry::with_dp_rank_hint_slack(
+            &[0, 1].map(|rank| connected_engine(EngineId::from_engine_index(rank))),
+            None,
+        );
+        set_running(&mut registry, 0, 12, 18);
+        set_running(&mut registry, 1, 0, 0);
+        let (chosen, _) =
+            registry.register("pinned".into(), None, Some(0), NonZeroU32::MIN).unwrap();
+        assert_eq!(chosen.engine_index(), Some(0));
+        assert_eq!(
+            (registry.dp_rank_hints, registry.dp_rank_hints_moved),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn soft_rank_hint_is_kept_within_slack() {
+        let mut registry = soft_hint_registry(&[0, 1, 2], 1);
+        set_running(&mut registry, 0, 9, 0);
+        set_running(&mut registry, 1, 8, 0);
+        set_running(&mut registry, 2, 10, 0);
+        // Rank 0 is one above the least-loaded rank 1: within slack 1.
+        let (chosen, _) = registry.register("a".into(), None, Some(0), NonZeroU32::MIN).unwrap();
+        // Rank 2 was two above rank 1 (10 vs 8): beyond slack 1, so it moves.
+        let (moved, _) = registry.register("b".into(), None, Some(2), NonZeroU32::MIN).unwrap();
+        expect_test::expect!["(Some(0), Some(1), 2, 1)"].assert_eq(&format!(
+            "{:?}",
+            (
+                chosen.engine_index(),
+                moved.engine_index(),
+                registry.dp_rank_hints,
+                registry.dp_rank_hints_moved
+            )
+        ));
+    }
+
+    #[test]
+    fn soft_rank_hint_counts_waiting_and_admissions() {
+        let mut registry = soft_hint_registry(&[0, 1], 2);
+        // Rank 0 is at its cap with work waiting: 12 + 3 against 12.
+        set_running(&mut registry, 0, 12, 3);
+        set_running(&mut registry, 1, 12, 0);
+        let (first, _) = registry.register("a".into(), None, Some(0), NonZeroU32::MIN).unwrap();
+        // Admissions since the snapshot count: rank 1 is now 13, rank 0 15.
+        let (second, _) = registry.register("b".into(), None, Some(0), NonZeroU32::MIN).unwrap();
+        expect_test::expect!["[Some(1), Some(0)]"].assert_eq(&format!(
+            "{:?}",
+            [first.engine_index(), second.engine_index()]
+        ));
+    }
+
+    #[test]
+    fn soft_rank_hint_breaks_ties_by_inflight_prompt_tokens() {
+        let mut registry = soft_hint_registry(&[0, 1, 2, 3], 0);
+        registry
+            .register_with_prompt_tokens("long".into(), None, Some(1), NonZeroU32::MIN, 140_000)
+            .unwrap();
+        registry
+            .register_with_prompt_tokens("short".into(), None, Some(2), NonZeroU32::MIN, 2_000)
+            .unwrap();
+        registry
+            .register_with_prompt_tokens("mid".into(), None, Some(3), NonZeroU32::MIN, 60_000)
+            .unwrap();
+        // Rank 0 gets two more; ranks 1-3 tie at one each.
+        for index in 0..2 {
+            registry
+                .register_with_prompt_tokens(
+                    format!("r0-{index}"),
+                    None,
+                    Some(0),
+                    NonZeroU32::MIN,
+                    1,
+                )
+                .unwrap();
+        }
+        // Rank 0 (2) is above the least loaded (1): the tie among 1-3 goes to
+        // the fewest prompt tokens, rank 2, not to the lowest index.
+        let (chosen, _) = registry
+            .register_with_prompt_tokens("hinted".into(), None, Some(0), NonZeroU32::MIN, 50_000)
+            .unwrap();
+        assert_eq!(chosen.engine_index(), Some(2));
+        let tokens: Vec<_> = registry
+            .routing_per_engine
+            .values()
+            .map(|state| (state.inflight, state.inflight_prompt_tokens))
+            .collect();
+        expect_test::expect!["[(2, 2), (1, 140000), (2, 52000), (1, 60000)]"]
+            .assert_eq(&format!("{tokens:?}"));
+
+        // Removing every request returns each engine to zero.
+        for id in ["long", "short", "mid", "r0-0", "r0-1", "hinted"] {
+            drop(registry.remove(id));
+        }
+        assert!(
+            registry
+                .routing_per_engine
+                .values()
+                .all(|state| state.inflight == 0 && state.inflight_prompt_tokens == 0)
+        );
+    }
+
+    #[test]
+    fn soft_rank_hint_still_rejects_unknown_ranks() {
+        let mut registry = soft_hint_registry(&[0, 1], 1);
+        let error = registry.register("bad".into(), None, Some(7), NonZeroU32::MIN).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::Error::InvalidDataParallelRank { rank: 7, .. }
+        ));
+        assert_eq!(registry.dp_rank_hints, 0);
+    }
+
+    #[test]
+    fn soft_rank_hint_leaves_unhinted_routing_unchanged() {
+        let mut soft = soft_hint_registry(&[2, 5, 9], 0);
+        let mut stock = RequestRegistry::with_dp_rank_hint_slack(
+            &[2, 5, 9].map(|rank| connected_engine(EngineId::from_engine_index(rank))),
+            None,
+        );
+        let mut routes = [Vec::new(), Vec::new()];
+        for (registry, routes) in [&mut soft, &mut stock].into_iter().zip(routes.iter_mut()) {
+            for index in 0..7 {
+                let (engine, _) = registry
+                    .register_with_prompt_tokens(
+                        format!("auto-{index}"),
+                        None,
+                        None,
+                        NonZeroU32::MIN,
+                        1000 * (7 - index),
+                    )
+                    .unwrap();
+                routes.push(engine.engine_index().unwrap());
+            }
+        }
+        assert_eq!(routes[0], routes[1]);
+        expect_test::expect!["[2, 5, 9, 2, 5, 9, 2]"].assert_eq(&format!("{:?}", routes[0]));
+    }
+
+    /// Sticky sessions on 8 ranks: a few long sessions keep naming one rank.
+    /// Exclusive pins pile them up; soft hints keep the busiest rank near the
+    /// mean while most requests still go where they were hinted.
+    #[test]
+    fn soft_rank_hint_balances_sticky_sessions() {
+        fn simulate(slack: Option<usize>) -> (usize, usize, u64, u64) {
+            let engines: Vec<_> =
+                (0..8).map(|rank| connected_engine(EngineId::from_engine_index(rank))).collect();
+            let mut registry = RequestRegistry::with_dp_rank_hint_slack(&engines, slack);
+            // Deterministic hint stream: half the requests name rank 0 or 1
+            // (hot sessions), the rest spread over all ranks.
+            let mut live: std::collections::VecDeque<String> = Default::default();
+            let mut max_load = 0;
+            for index in 0..4000u32 {
+                let hint = if index % 2 == 0 {
+                    index % 4 / 2
+                } else {
+                    index * 7 % 8
+                };
+                let id = format!("req-{index}");
+                registry.register(id.clone(), None, Some(hint), NonZeroU32::MIN).unwrap();
+                live.push_back(id);
+                // 64 requests in flight (8 per rank on average), FIFO completion.
+                if live.len() > 64 {
+                    drop(registry.remove(&live.pop_front().unwrap()));
+                }
+                let load = registry.routing_per_engine.values().map(|s| s.inflight).max().unwrap();
+                if index >= 64 {
+                    max_load = max_load.max(load);
+                }
+            }
+            let min_load = registry.routing_per_engine.values().map(|s| s.inflight).min().unwrap();
+            (
+                max_load,
+                min_load,
+                registry.dp_rank_hints,
+                registry.dp_rank_hints_moved,
+            )
+        }
+        let report = format!(
+            "exclusive {:?} slack1 {:?}",
+            simulate(None),
+            simulate(Some(1))
+        );
+        println!("{report}");
+        expect_test::expect!["exclusive (24, 0, 0, 0) slack1 (9, 7, 4000, 1430)"]
+            .assert_eq(&report);
     }
 
     #[test]
